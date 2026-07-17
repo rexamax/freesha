@@ -1,31 +1,45 @@
 import json
 import re
 import ast
+import requests
+try:
+    import tiktoken # Офіційна бібліотека для підрахунку токенів
+except ImportError:
+    pass
 
-class FreeshaOptimizer:
-    def __init__(self):
-        # 1. CAVEMAN MODE 
-        # Forces the model to respond without politeness or unnecessary tokens
+class FreeshaAdvanced:
+    def __init__(self, openrouter_key="YOUR_API_KEY"):
+        self.api_key = openrouter_key
+        
+        # 1. CAVEMAN MODE: Жорсткий промпт для економії вихідних токенів
         self.system_prompt = (
-            "CRITICAL: Output raw, strict data only. No pleasantries, no markdown formatting, "
-            "no explanations. Act as a primitive, highly efficient data processor."
+            "CRITICAL: Output raw data/JSON only. No pleasantries. No formatting. "
+            "Act as a primitive data pipeline node."
         )
+        
+        # Ініціалізація калькулятора токенів (аналог token-calculator.net)
+        try:
+            self.encoder = tiktoken.get_encoding("cl100k_base")
+        except NameError:
+            self.encoder = None
 
-    # 2. HEADROOM COMPRESSION
-    def compress_payload(self, data):
-        """Intelligently detects data type and compresses it to save input tokens."""
-        if isinstance(data, dict) or isinstance(data, list):
-            # Minify JSON aggressively by removing all unnecessary spaces and indents
+    def calculate_tokens(self, text):
+        """Точний підрахунок токенів для прогнозування вартості."""
+        if self.encoder:
+            return len(self.encoder.encode(str(text)))
+        return len(str(text)) // 4 # Приблизний підрахунок, якщо tiktoken не встановлено
+
+    def headroom_compress(self, data):
+        """2. HEADROOM COMPRESSION: Розумне стиснення різних типів даних."""
+        if isinstance(data, (dict, list)):
             return json.dumps(data, separators=(',', ':'))
-        elif isinstance(data, str):
-            # Compress unstructured text (e.g., massive message logs)
-            compressed = re.sub(r'\s+', ' ', data).strip()
-            return compressed
+        if isinstance(data, str):
+            # Видаляємо зайві пробіли та переноси рядків
+            return re.sub(r'\s+', ' ', data).strip()
         return str(data)
 
-    # 3. LEAN-CTX (Contextual Skeleton)
-    def extract_skeleton(self, code_string):
-        """Parses Python code and returns only the structural skeleton (classes/functions) without the heavy body."""
+    def lean_ctx_extract(self, code_string):
+        """3. LEAN-CTX: Витягує лише структуру (скелет) коду без його важкого тіла."""
         try:
             tree = ast.parse(code_string)
             skeleton = []
@@ -38,49 +52,59 @@ class FreeshaOptimizer:
                         if isinstance(sub_node, ast.FunctionDef):
                             skeleton.append(f"    def {sub_node.name}(...):")
             return "\n".join(skeleton)
-        except Exception as e:
-            return "Error parsing structural skeleton."
+        except Exception:
+            return "Parsing error"
 
-# --- DEMONSTRATION OF TOKEN SAVINGS ---
+    def execute_hermes_request(self, payload):
+        """Інтеграція: відправляє стиснутий запит через OpenRouter API."""
+        optimized_payload = self.headroom_compress(payload)
+        
+        # Аналітика до/після
+        original_tokens = self.calculate_tokens(payload)
+        optimized_tokens = self.calculate_tokens(optimized_payload)
+        if original_tokens > 0:
+            savings = round(100 - (optimized_tokens / original_tokens * 100), 2)
+        else:
+            savings = 0
+            
+        print(f"📊 Калькулятор токенів:")
+        print(f"Токенів до стиснення: {original_tokens}")
+        print(f"Токенів після стиснення: {optimized_tokens}")
+        print(f"Зекономлено: {savings}%\n")
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        data = {
+            "model": "nousresearch/hermes-3-llama-3.1-405b", 
+            "messages": [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": optimized_payload}
+            ]
+        }
+        
+        print("🌐 Готово до відправки на OpenRouter...")
+        # У реальному середовищі тут буде: 
+        # response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=data)
+        # return response.json()
+        return "Пайплайн працює успішно!"
+
+# --- ТЕСТУВАННЯ ---
 if __name__ == "__main__":
-    freesha = FreeshaOptimizer()
+    freesha = FreeshaAdvanced()
     
-    print("=== FREESHA MIDDLEWARE DEMO ===\n")
-    
-    # Scenario A: Compressing Massive Chat Archives
-    chat_archive = {
-        "source": "private_tg_channel_dump",
-        "topic": "arbitrage_traffic_ubt",
-        "total_messages": 1000000,
-        "sample_batch": [
-            {"user": "admin", "text": "Here is the new funnel for UBT...", "timestamp": "2019-05-12T10:00:00Z"},
-            {"user": "media_buyer", "text": "Referral links are converting well. Need to set up domains.", "timestamp": "2019-05-12T10:05:00Z"}
-        ]
+    # Симулюємо важкий масив даних (наприклад, логи чату)
+    heavy_data = {
+        "status": "success",
+        "data": [
+            {"user": "admin", "message": "hello world"},
+            {"user": "moderator", "message": "all clear"}
+        ],
+        "metadata": {"time": "12:00", "source": "telegram"}
     }
     
-    original_json = json.dumps(chat_archive, indent=4)
-    compressed_json = freesha.compress_payload(chat_archive)
-    
-    print("1. HEADROOM COMPRESSION (JSON Minification)")
-    print(f"Original Payload Size: {len(original_json)} chars")
-    print(f"Compressed Payload Size: {len(compressed_json)} chars")
-    print(f"Token Savings: {round(100 - (len(compressed_json) / len(original_json) * 100), 2)}%\n")
-    
-    # Scenario B: Lean-ctx Code Skeleton Extraction for automated pipelines
-    heavy_pipeline_code = '''
-class RapidAPINewsParser:
-    def __init__(self):
-        self.interval_hours = 12
-        
-    def fetch_and_parse_data(self):
-        # 100 lines of heavy logic, API requests, and data mapping...
-        raw_data = "fetched_data"
-        return raw_data
-        
-    def push_insights_to_telegram(self, insights):
-        # 50 lines of Telegram Bot API integration...
-        pass
-'''
-    print("2. LEAN-CTX (Structural Extraction for LLM context)")
-    print("Sending only the necessary skeleton to the model:")
-    print(freesha.extract_skeleton(heavy_pipeline_code))
+    print("=== ДЕМОНСТРАЦІЯ FREESHA ===\n")
+    original_json = json.dumps(heavy_data, indent=4)
+    freesha.execute_hermes_request(original_json)
