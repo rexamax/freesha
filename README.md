@@ -13,3 +13,6 @@ As developers integrating LLMs into daily workflows, we hit a massive bottleneck
 
 ## Tech Stack
 `Python`, `OpenAI API`, `AST Parsing`, `JSON Minification`
+
+## How Codex & GPT-5.6 are used
+Freesha is designed to act as a middleware for OpenAI's most advanced models. We use **Codex** to automatically test and refine our AST parsing logic (Lean-ctx), ensuring the structural extraction of Python code is perfectly formatted for LLM consumption. **GPT-5.6** is utilized as the primary engine for analyzing the compressed payloads, proving that our token-reduction strategies (Headroom & Caveman mode) do not degrade the model's analytical capabilities even when processing complex, minified JSON architectures.
