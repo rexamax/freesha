@@ -51,6 +51,14 @@ Print a Python structure map:
 python3 freesha_core.py skeleton src/example.py
 ```
 
+Create and update local structured tasks without an LLM request:
+
+```bash
+python3 freesha_core.py task add "Prepare Build Week demo" --priority high
+python3 freesha_core.py task list
+python3 freesha_core.py ledger
+```
+
 Use the library:
 
 ```python

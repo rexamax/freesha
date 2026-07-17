@@ -367,6 +367,20 @@ def main(argv: list[str] | None = None) -> int:
     optimize.add_argument("path", nargs="?", help="JSON file; stdin when omitted")
     skeleton = sub.add_parser("skeleton")
     skeleton.add_argument("path")
+    task = sub.add_parser("task")
+    task_sub = task.add_subparsers(dest="task_command", required=True)
+    task_add = task_sub.add_parser("add")
+    task_add.add_argument("title")
+    task_add.add_argument("--priority", default="normal")
+    task_list = task_sub.add_parser("list")
+    task_list.add_argument("--path", default=".freesha/tasks.json")
+    task_update = task_sub.add_parser("update")
+    task_update.add_argument("id")
+    task_update.add_argument("--path", default=".freesha/tasks.json")
+    task_update.add_argument("--status")
+    task_update.add_argument("--priority")
+    ledger = sub.add_parser("ledger")
+    ledger.add_argument("--path", default=".freesha/receipts.jsonl")
     args = parser.parse_args(argv)
 
     optimizer = FreeshaOptimizer()
@@ -378,6 +392,18 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"optimized": result.optimized, "receipt": asdict(result)}, ensure_ascii=False, indent=2))
     elif args.command == "skeleton":
         print(optimizer.python_skeleton(Path(args.path).read_text(encoding="utf-8")))
+    elif args.command == "task":
+        task_path = Path(getattr(args, "path", ".freesha/tasks.json"))
+        store = TaskStore(task_path)
+        if args.task_command == "add":
+            print(json.dumps(asdict(store.add(args.title, args.priority)), ensure_ascii=False, indent=2))
+        elif args.task_command == "list":
+            print(json.dumps([asdict(task) for task in store.list()], ensure_ascii=False, indent=2))
+        elif args.task_command == "update":
+            changes = {key: value for key, value in {"status": args.status, "priority": args.priority}.items() if value is not None}
+            print(json.dumps(asdict(store.update(args.id, **changes)), ensure_ascii=False, indent=2))
+    elif args.command == "ledger":
+        print(json.dumps(SavingsLedger(Path(args.path)).summary(), ensure_ascii=False, indent=2))
     return 0
 
 
