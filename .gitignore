@@ -1,3 +1,6 @@
+# Local Freesha state (may contain recoverable user context)
+.freesha/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

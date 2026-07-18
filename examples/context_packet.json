@@ -1,0 +1,29 @@
+{
+  "task": "Investigate checkout timeout request req-42",
+  "items": [
+    {
+      "id": "contract",
+      "content": "Keep the public API stable and preserve request identifiers.",
+      "required": true,
+      "priority": "critical"
+    },
+    {
+      "id": "incident",
+      "content": "ERROR req-42 checkout timeout in payment worker",
+      "priority": "high"
+    },
+    {
+      "id": "duplicate-a",
+      "content": "Routine worker heartbeat completed successfully."
+    },
+    {
+      "id": "duplicate-b",
+      "content": "Routine worker heartbeat completed successfully."
+    },
+    {
+      "id": "design-note",
+      "content": "Optional interface color discussion unrelated to the incident.",
+      "priority": "low"
+    }
+  ]
+}

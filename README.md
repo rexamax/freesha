@@ -1,160 +1,279 @@
 # Freesha
 
-**Project name:** Freesha
+**Local-first economy mode for OpenAI-compatible AI workflows.**
 
-**Elevator pitch (under 200 characters):**
+Freesha reduces avoidable input tokens before an API call, keeps large omitted data recoverable on the local machine, and emits receipts instead of unsupported savings claims.
 
-> Freesha is a local-first context layer for Codex and OpenAI-compatible apps that structures tasks, removes lossless payload waste, reuses repeated context, and proves token savings before sending.
+> Bundled offline benchmark: **76.68% aggregate reduction** with the dependency-free fallback estimator and **79.59%** with optional `tiktoken/o200k_base`, with all deterministic quality gates passing. These are workload-specific local estimates—not a guarantee for every request and not a provider billing receipt.
 
-## The problem
+## Why it exists
 
-AI agents do not only spend tokens on the answer. They repeatedly resend verbose JSON, unchanged context, tool output, and task history. Most “token saver” demos either change the model's behavior with a prompt or make lossy compression claims without a receipt.
+AI apps repeatedly send waste that does not improve the answer:
 
-Freesha takes a narrower approach: **optimize what can be optimized deterministically, keep an audit receipt, and never make a network request unless the caller explicitly asks for forwarding.**
+- pretty-printed JSON;
+- repeated status and tool-output lines;
+- duplicate context items;
+- irrelevant context that does not fit the current task;
+- unstable prompt layouts that prevent provider cache hits.
 
-## What works today
+Freesha applies the cheapest safe operation first and passes through input when an optimization would be a net loss.
 
-- **Lossless JSON minification** inside message content. Parsed JSON is serialized without whitespace and remains semantically identical.
-- **Token receipt** with before/after estimates, transformations, and tokenizer provenance.
-- **Content-addressed local context cache**. Repeated identical context is recognized locally without re-sending it to Freesha or a provider.
-- **Python structure view**. Extracts classes, callable signatures, and control-flow headers instead of sending an entire file when a map is enough.
-- **Local task ledger**. Creates and updates small structured tasks without an LLM call.
-- **Explicit OpenAI-compatible forwarding helper**. `forward_chat()` only sends when the caller supplies `OPENAI_API_KEY`; optimization itself is offline.
-- **Optional compact-output prompt presets** (`lite`, `full`, `ultra`) that preserve code, commands, and errors.
+## Economy pipeline
+
+```text
+input
+  ├─ lossless JSON minification
+  ├─ byte-exact context deduplication
+  ├─ recoverable log-template compaction
+  ├─ required + task-relevant context selection
+  ├─ token budget / net-loss gates
+  └─ optional documented GPT-5.6 prompt-cache fields
+       ↓
+optimized context + local recovery blobs + receipt
+       ↓
+API call only when the host application explicitly makes one
+```
+
+### Safety properties
+
+- **Local by default:** optimization and benchmark commands make zero network calls.
+- **Recoverable:** compressed or omitted content is stored under `.freesha/blobs/` by SHA-256 and can be restored byte-for-byte.
+- **Critical-line preservation:** errors, failures, warnings, exceptions, panics, access denials, and timeouts are kept verbatim during log compaction.
+- **Net-loss gate:** short or incompressible output is returned unchanged.
+- **No unknown request fields:** the old custom `metadata` injection was removed.
+- **No telemetry, accounts, or mandatory dependencies.**
 
 ## Quick start
 
-Requires Python 3.11+. There are no mandatory dependencies.
+Python 3.11+:
 
 ```bash
 git clone https://github.com/rexamax/freesha.git
 cd freesha
 python3 -m unittest discover -s tests -v
-python3 freesha_core.py demo
+python3 freesha_core.py benchmark
 ```
 
-For more accurate OpenAI-family token counts, install the optional tokenizer:
+Optional local tokenizer approximation:
 
 ```bash
-python3 -m pip install -e '.[tokens]'
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e '.[tokens]'
+freesha benchmark
 ```
 
-Optimize a JSON file without calling an API:
+`tiktoken/o200k_base` is labeled as a **local estimate**. OpenAI's token-count endpoint and response `usage` fields are authoritative for provider billing.
+
+## Current benchmark
+
+Run:
+
+```bash
+python3 freesha_core.py benchmark
+```
+
+Expected shape (exact token counts can differ depending on whether optional `tiktoken` is installed):
+
+```json
+{
+  "benchmark": "freesha-economy-v1",
+  "network_calls": 0,
+  "aggregate": {
+    "reduction_pct": 79.59
+  },
+  "scenarios": {
+    "lossless_json": {"reduction_pct": 45.41},
+    "recoverable_logs": {"reduction_pct": 97.13},
+    "budgeted_context": {"reduction_pct": 82.02}
+  },
+  "quality_gates": {
+    "json_equivalent": true,
+    "log_exactly_recoverable": true,
+    "critical_error_preserved": true,
+    "required_context_preserved": true,
+    "relevant_context_preserved": true,
+    "context_budget_respected": true,
+    "omissions_recoverable": true,
+    "net_loss_gate": true,
+    "all_passed": true
+  }
+}
+```
+
+The benchmark intentionally reports each scenario separately. JSON whitespace removal may save much less than repetitive logs; a short prompt may save nothing.
+
+## CLI
+
+### 1. Compact tool or log output
+
+```bash
+python3 freesha_core.py compact-output examples/repetitive.log
+```
+
+The JSON result contains compacted output, before/after token estimates, reduction percentage, and a `recovery_key`.
+
+Restore the original exactly:
+
+```bash
+python3 freesha_core.py recover <RECOVERY_KEY>
+```
+
+### 2. Build an economy context packet
+
+```bash
+python3 freesha_core.py economy examples/context_packet.json --budget 48
+```
+
+Input contract:
+
+```json
+{
+  "task": "Investigate checkout timeout request req-42",
+  "items": [
+    {
+      "id": "contract",
+      "content": "Keep the public API stable.",
+      "required": true,
+      "priority": "critical"
+    },
+    {
+      "id": "incident",
+      "content": "ERROR req-42 checkout timeout",
+      "kind": "text",
+      "priority": "high"
+    }
+  ]
+}
+```
+
+Rules:
+
+- `id` must be a unique, short public-safe identifier, not a filesystem path;
+- `required: true` always wins;
+- relevance is deterministic lexical overlap plus explicit priority and critical signals;
+- `kind: "json"` enables lossless minification;
+- `kind: "log"` enables recoverable template compaction;
+- only byte-identical optional content is deduplicated; whitespace and formatting differences are preserved;
+- duplicate and omitted items receive local recovery keys in the receipt.
+
+### 3. Prepare GPT-5.6 prompt caching
+
+Keep static instructions and tools first, variable user data last. Then run:
+
+```bash
+python3 freesha_core.py prepare-openai-cache \
+  examples/openai_request.json \
+  --key support:v1
+```
+
+Freesha adds only documented GPT-5.6 fields:
+
+```json
+{
+  "prompt_cache_key": "support:v1",
+  "prompt_cache_options": {
+    "mode": "implicit",
+    "ttl": "30m"
+  }
+}
+```
+
+Important: GPT-5.6 cache writes are billed at 1.25× uncached input, while reads can save cost. A stable key is useful only when the same long prefix is reused. Measure `cached_tokens` and `cache_write_tokens`; do not assume caching always saves money.
+
+### 4. Existing utilities
 
 ```bash
 python3 freesha_core.py optimize-json payload.json
-```
-
-Print a Python structure map:
-
-```bash
 python3 freesha_core.py skeleton src/example.py
-```
-
-Create and update local structured tasks without an LLM request:
-
-```bash
-python3 freesha_core.py task add "Prepare Build Week demo" --priority high
+python3 freesha_core.py task add "Prepare demo" --priority high
 python3 freesha_core.py task list
 python3 freesha_core.py ledger
 ```
 
-Use the library:
+## Python API
 
 ```python
-from freesha_core import FreeshaOptimizer
+from pathlib import Path
 
-payload = {
-    "model": "gpt-5.6",
-    "messages": [{
-        "role": "user",
-        "content": '{"events": [  { "id": 1, "kind": "signal" }  ]}',
-    }],
+from freesha_core import ContentStore, EconomyContextPlanner
+
+packet = {
+    "task": "Investigate request req-42 timeout",
+    "items": [
+        {"id": "contract", "content": "Keep API stable.", "required": True},
+        {"id": "incident", "content": "ERROR req-42 timeout"},
+    ],
 }
 
-result = FreeshaOptimizer().optimize_payload(payload)
+planner = EconomyContextPlanner(ContentStore(Path(".freesha/blobs")))
+result = planner.build(packet, token_budget=500)
+print(result.context)
 print(result.receipt)
-# Forward only after an explicit opt-in:
-# from freesha_core import forward_chat
-# response = forward_chat(result.payload)
 ```
 
-## Architecture
+## How to prove real API value
+
+A local estimate is not enough for a production claim. Use this A/B protocol:
+
+1. Build a fixed task set with expected facts, IDs, and pass/fail criteria.
+2. Send the baseline request and the Freesha request to the **same model and settings**.
+3. For exact OpenAI input counts, use `POST /v1/responses/input_tokens` on both request shapes.
+4. For live calls, record `input_tokens`, `output_tokens`, `cached_tokens`, `cache_write_tokens`, latency, retries, and price.
+5. Run the same quality checks on both answers.
+6. Count savings only when the optimized answer still passes the quality gate.
+7. Repeat long stable prefixes within the provider cache TTL to measure read/write economics.
+
+The useful metric is:
 
 ```text
-caller / Codex helper / app
-          |
-          v
-  FreeshaOptimizer
-  ├── content detector
-  ├── lossless JSON minifier
-  ├── Python structure extractor (explicit mode)
-  ├── local SHA-256 context cache
-  ├── token receipt / savings ledger
-  └── optional OpenAI-compatible forwarder
-          |
-          v
-  OpenAI / Codex-compatible endpoint (opt-in only)
+net value = provider cost avoided - cache-write/compression cost
 ```
 
-Freesha does **not** pretend that arbitrary prose can be compressed losslessly by deleting words. Free-text compression is a future, opt-in A/B experiment and must be quality-gated. Current automatic optimization is intentionally conservative.
-
-## What we learned from the reference projects
-
-- **Caveman:** output-style control can reduce ceremony, but a system prompt is not input compression and does not prove savings. Freesha keeps the idea as explicit output presets and records no fake percentage.
-- **Headroom:** the important architectural idea is a local content router plus reversible/cache-aware context handling. Freesha starts with a smaller dependency-free core instead of copying its model-based compressors.
-- **LeanCTX:** signatures, selective reads, caching, and receipts are more valuable than blindly minifying every string. Freesha's Python skeleton is explicit because a structure map is not a substitute for source code when implementation details matter.
-
-Freesha is an independent implementation. It does not copy code from those repositories.
-
-## Codex and GPT-5.6 usage
-
-This project is being developed with Codex during OpenAI Build Week. GPT-5.6/Codex is used for the implementation, test design, debugging, and review of the optimization pipeline. The README and demo claims are intentionally limited to behavior that can be exercised locally.
-
-For the Devpost submission, add the actual Codex feedback/session identifier from the primary Codex build session:
+Not:
 
 ```text
-/feedback <SESSION_ID_FROM_CODEX>
+local characters removed = money saved
 ```
 
-The identifier must be obtained inside the Codex app/session where the majority of the project was built. A Hermes chat ID is not a substitute.
+## What the 70%+ result means
 
-## Measurement plan
+The included mixed fixture currently clears 70% aggregate reduction because it contains the waste Freesha targets: verbose JSON, repetitive tool logs, duplicates, and off-task context. It does **not** mean:
 
-Every optimization produces a receipt. The first benchmark target is not “70%” in the abstract; it is:
+- every request becomes 70% smaller;
+- response quality is universally unchanged;
+- 70% fewer TPM rate-limit tokens (prompt caching still counts toward TPM);
+- 70% lower total bill when output/reasoning dominates;
+- local estimates equal provider billing.
 
-1. byte/token reduction on representative Telegram/news JSON payloads;
-2. exact `json.loads(before) == json.loads(after)` for lossless JSON transforms;
-3. unchanged results on a fixed classification fixture;
-4. cache hit rate on repeated context;
-5. no network request during local optimization.
+## Privacy and storage
 
-The current test suite proves the first vertical slice. More real OpenAI A/B runs should be added before making quality or dollar-savings claims.
+- Recovery blobs remain local and are ignored by Git through `.freesha/`.
+- Blob filenames are SHA-256 hashes; files are created with owner-only permissions.
+- The cache stores no API key.
+- `forward_chat()` is explicit opt-in and requires `OPENAI_API_KEY` only at call time.
+- Do not commit recovery blobs, `.env`, API keys, session files, customer data, or private source material.
+- Treat recovery keys as sensitive references when the underlying content is sensitive.
 
-## Hackathon fit
+## Public design references
 
-Primary track: **Work and Productivity**. Secondary fit: **Developer Tools**.
+The implementation is independent and does not copy third-party code. Its provider-aware behavior follows current public documentation:
 
-The demo should be under three minutes:
+- [OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching)
+- [OpenAI token counting](https://developers.openai.com/api/docs/guides/token-counting)
+- [OpenAI compaction](https://developers.openai.com/api/docs/guides/compaction)
+- [OpenAI cost optimization](https://developers.openai.com/api/docs/guides/cost-optimization)
+- [OpenAI tool search](https://developers.openai.com/api/docs/guides/tools-tool-search)
 
-1. Show a verbose JSON payload and run Freesha offline.
-2. Show the receipt: before/after estimate and exact JSON equivalence.
-3. Repeat the same context and show a local cache hit.
-4. Show the Python structure view.
-5. Show that forwarding is opt-in and that no key is required for local optimization.
-6. Explain where Codex/GPT-5.6 helped build and test the project.
+## Limitations and next high-ROI step
 
-## Security and privacy
+Freesha is a working local core and CLI, not yet a transparent HTTP proxy or native Codex hook. The next production milestone should be an OpenAI Responses-compatible local gateway that:
 
-- No telemetry or accounts are needed for local features.
-- No API key is hardcoded or required for optimization.
-- Context cache stores hashes and small metadata, not the original content.
-- Do not commit `.env`, provider keys, session files, or private project data.
-- Network forwarding is explicit and uses the standard `OPENAI_API_KEY` environment variable.
-
-## Status
-
-This is a working hackathon MVP, not a finished universal proxy. The next high-value additions are a local HTTP compatibility endpoint, reversible retrieval by hash, a fixed A/B quality benchmark, and a small dashboard for receipts.
+1. calls the official token-count endpoint optionally;
+2. records provider usage receipts;
+3. supports explicit cache breakpoints for stable prefixes;
+4. runs a fixed answer-quality eval suite;
+5. exposes recovery through a narrow local tool.
 
 ## License
 

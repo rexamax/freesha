@@ -1,6 +1,6 @@
 [project]
 name = "freesha"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local-first token and context optimizer for OpenAI-compatible workflows"
 requires-python = ">=3.11"
 readme = "README.md"
@@ -9,7 +9,8 @@ authors = [{name = "rexamax"}]
 dependencies = []
 
 [project.optional-dependencies]
-tokens = ["tiktoken>=0.7"]
+tokens = ["tiktoken>=0.13"]
+dev = ["ruff>=0.15"]
 
 [project.scripts]
 freesha = "freesha_core:main"
@@ -17,3 +18,9 @@ freesha = "freesha_core:main"
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

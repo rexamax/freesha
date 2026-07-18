@@ -1,0 +1,10 @@
+2026-07-18T12:00:00Z INFO worker job=1001 completed in 11ms
+2026-07-18T12:00:01Z INFO worker job=1002 completed in 12ms
+2026-07-18T12:00:02Z INFO worker job=1003 completed in 13ms
+2026-07-18T12:00:03Z INFO worker job=1004 completed in 14ms
+2026-07-18T12:00:04Z ERROR request_id=req-42 database timeout
+2026-07-18T12:00:05Z INFO worker job=1005 completed in 15ms
+2026-07-18T12:00:06Z INFO worker job=1006 completed in 16ms
+2026-07-18T12:00:07Z INFO worker job=1007 completed in 17ms
+2026-07-18T12:00:08Z INFO worker job=1008 completed in 18ms
+2026-07-18T12:00:09Z INFO worker job=1009 completed in 19ms

@@ -1,0 +1,13 @@
+{
+  "model": "gpt-5.6",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a support assistant. Follow the stable support policy and preserve request identifiers."
+    },
+    {
+      "role": "user",
+      "content": "Investigate request req-42."
+    }
+  ]
+}
