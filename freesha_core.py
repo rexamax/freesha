@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -302,30 +303,32 @@ class ContentStore:
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
+        self._write_lock = threading.Lock()
 
     def put(self, content: str) -> str:
         text = str(content)
         key = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        self.path.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.path, 0o700)
-        destination = self.path / f"{key}.txt"
-        if not destination.exists():
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                dir=self.path,
-                prefix=f".{key}.",
-                suffix=".tmp",
-                delete=False,
-            ) as handle:
-                handle.write(text.encode("utf-8"))
-                temp = Path(handle.name)
-            try:
-                os.chmod(temp, 0o600)
-                temp.replace(destination)
-            finally:
-                if temp.exists():
-                    temp.unlink()
-        os.chmod(destination, 0o600)
+        with self._write_lock:
+            self.path.mkdir(parents=True, exist_ok=True)
+            os.chmod(self.path, 0o700)
+            destination = self.path / f"{key}.txt"
+            if not destination.exists():
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    dir=self.path,
+                    prefix=f".{key}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as handle:
+                    handle.write(text.encode("utf-8"))
+                    temp = Path(handle.name)
+                try:
+                    os.chmod(temp, 0o600)
+                    temp.replace(destination)
+                finally:
+                    if temp.exists():
+                        temp.unlink()
+            os.chmod(destination, 0o600)
         return key
 
     def get(self, key: str | None) -> str:
@@ -940,6 +943,13 @@ def main(argv: list[str] | None = None) -> int:
     cache.add_argument("--key", required=True)
     benchmark = sub.add_parser("benchmark", help="run the offline economy benchmark")
     benchmark.add_argument("--store", default=".freesha/benchmark-blobs")
+    joy = sub.add_parser(
+        "joy", help="preview experimental fixture-based model routing (dry-run only)"
+    )
+    joy.add_argument("path", help="JOY task JSON")
+    joy.add_argument("--models", required=True, help="fixture-only model catalog JSON")
+    joy.add_argument("--dry-run", action="store_true")
+    joy.add_argument("--store", default=".freesha/joy-blobs")
     task = sub.add_parser("task")
     task_sub = task.add_subparsers(dest="task_command", required=True)
     task_add = task_sub.add_parser("add")
@@ -1018,6 +1028,27 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.command == "benchmark":
         print(json.dumps(run_benchmark(Path(args.store)), ensure_ascii=False, indent=2))
+    elif args.command == "joy":
+        if not args.dry_run:
+            parser.error("experimental JOY requires --dry-run; live execution is unavailable")
+        from freesha_joy import JoyRouter, load_json_object
+
+        try:
+            task_payload = load_json_object(Path(args.path))
+            model_catalog = load_json_object(Path(args.models))
+        except OSError:
+            parser.error("JOY could not read one of the input files")
+        except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            parser.error(f"JOY input validation failed: {exc}")
+        try:
+            receipt = JoyRouter(ContentStore(Path(args.store))).route(
+                task_payload, model_catalog
+            )
+        except (TypeError, ValueError) as exc:
+            parser.error(f"JOY input validation failed: {exc}")
+        print(json.dumps(receipt, ensure_ascii=False, indent=2, allow_nan=False))
+        if not receipt["route_found"]:
+            return 2
     elif args.command == "task":
         task_path = Path(getattr(args, "path", ".freesha/tasks.json"))
         store = TaskStore(task_path)

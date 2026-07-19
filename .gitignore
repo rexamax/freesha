@@ -219,3 +219,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local-only Freesha state and demo media.
+.test-state/
+/demo_video/

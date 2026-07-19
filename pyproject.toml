@@ -19,6 +19,9 @@ freesha = "freesha_core:main"
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools]
+py-modules = ["freesha_core", "freesha_joy"]
+
 [tool.ruff]
 line-length = 100
 

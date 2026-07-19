@@ -1,7 +1,9 @@
 import json
-import tempfile
+import shutil
 import unittest
+import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 from freesha_core import (
@@ -14,6 +16,23 @@ from freesha_core import (
     ToolOutputCompactor,
     run_benchmark,
 )
+
+
+@contextmanager
+def writable_temp_directory():
+    """Create test state without Windows tempfile ACLs blocking child processes."""
+    root = (Path.cwd() / ".test-state" / "unit").resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    path = (root / uuid.uuid4().hex).resolve()
+    if path.parent != root:
+        raise RuntimeError("refusing to create test state outside .test-state/unit")
+    path.mkdir()
+    try:
+        yield str(path)
+    finally:
+        if path.parent != root:
+            raise RuntimeError("refusing to remove test state outside .test-state/unit")
+        shutil.rmtree(path)
 
 
 class FreeshaOptimizerTests(unittest.TestCase):
@@ -100,7 +119,7 @@ class RecoverableEconomyModeTests(unittest.TestCase):
         )
         source = "\n".join(lines)
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with writable_temp_directory() as tmp:
             store = ContentStore(Path(tmp) / "blobs")
             result = ToolOutputCompactor(store).compact(source)
 
@@ -112,14 +131,14 @@ class RecoverableEconomyModeTests(unittest.TestCase):
             self.assertEqual(store.get(result.recovery_key), source)
 
     def test_short_output_uses_net_loss_passthrough(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with writable_temp_directory() as tmp:
             result = ToolOutputCompactor(ContentStore(Path(tmp) / "blobs")).compact("ok")
             self.assertFalse(result.changed)
             self.assertEqual(result.output, "ok")
             self.assertIsNone(result.recovery_key)
 
     def test_net_loss_does_not_leave_orphan_recovery_blob(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with writable_temp_directory() as tmp:
             blob_path = Path(tmp) / "blobs"
             result = ToolOutputCompactor(ContentStore(blob_path), minimum_tokens=1).compact(
                 "a\na\na"
@@ -131,7 +150,7 @@ class RecoverableEconomyModeTests(unittest.TestCase):
 
     def test_content_store_concurrent_put_is_safe(self):
         content = "recoverable event payload"
-        with tempfile.TemporaryDirectory() as tmp:
+        with writable_temp_directory() as tmp:
             store = ContentStore(Path(tmp) / "blobs")
             with ThreadPoolExecutor(max_workers=16) as executor:
                 keys = list(executor.map(store.put, [content] * 64))
@@ -140,7 +159,7 @@ class RecoverableEconomyModeTests(unittest.TestCase):
 
     def test_content_store_preserves_crlf_exactly(self):
         content = "first\r\nsecond\rthird\n"
-        with tempfile.TemporaryDirectory() as tmp:
+        with writable_temp_directory() as tmp:
             store = ContentStore(Path(tmp) / "blobs")
             self.assertEqual(store.get(store.put(content)), content)
 
@@ -148,16 +167,21 @@ class RecoverableEconomyModeTests(unittest.TestCase):
         routine = "2026-07-18T12:00:00Z INFO worker job=1000 completed in 10ms"
         later = "2026-07-18T12:00:05Z INFO worker job=1005 completed in 15ms"
         critical = "2026-07-18T12:00:04Z ERROR request_id=req-7 timeout"
-        source = "\n".join([routine, routine, routine, critical, later, later])
+        source = "\n".join(([routine] * 24) + [critical] + ([later] * 18))
 
-        with tempfile.TemporaryDirectory() as tmp:
-            result = ToolOutputCompactor(ContentStore(Path(tmp) / "blobs")).compact(source)
+        with writable_temp_directory() as tmp:
+            store = ContentStore(Path(tmp) / "blobs")
+            result = ToolOutputCompactor(store).compact(source)
+            recovered = store.get(result.recovery_key)
 
         self.assertTrue(result.changed)
+        self.assertNotEqual(result.output, source)
         self.assertLess(result.output.index(routine), result.output.index(critical))
         self.assertLess(result.output.index(critical), result.output.index(later))
-        self.assertIn("[repeated x3", result.output)
-        self.assertIn("[repeated x2", result.output)
+        self.assertIn("[repeated x24", result.output)
+        self.assertIn("[repeated x18", result.output)
+        self.assertIsNotNone(result.recovery_key)
+        self.assertEqual(recovered, source)
 
     def test_context_planner_deduplicates_and_keeps_required_and_relevant_items(self):
         packet = {
@@ -179,7 +203,7 @@ class RecoverableEconomyModeTests(unittest.TestCase):
                 },
             ],
         }
-        with tempfile.TemporaryDirectory() as tmp:
+        with writable_temp_directory() as tmp:
             result = EconomyContextPlanner(content_store=ContentStore(Path(tmp) / "blobs")).build(
                 packet, token_budget=40
             )
@@ -199,7 +223,7 @@ class RecoverableEconomyModeTests(unittest.TestCase):
             "task": "Summarize",
             "items": [{"id": "/root/private/note.md", "content": "safe generic text"}],
         }
-        with tempfile.TemporaryDirectory() as tmp:
+        with writable_temp_directory() as tmp:
             planner = EconomyContextPlanner(ContentStore(Path(tmp) / "blobs"))
             with self.assertRaises(ValueError):
                 planner.build(packet, token_budget=100)
@@ -212,7 +236,7 @@ class RecoverableEconomyModeTests(unittest.TestCase):
                 {"id": "event", "content": "second event"},
             ],
         }
-        with tempfile.TemporaryDirectory() as tmp:
+        with writable_temp_directory() as tmp:
             planner = EconomyContextPlanner(ContentStore(Path(tmp) / "blobs"))
             with self.assertRaisesRegex(ValueError, "unique"):
                 planner.build(packet, token_budget=100)
@@ -223,7 +247,7 @@ class RecoverableEconomyModeTests(unittest.TestCase):
             "task": "Inspect request",
             "items": [{"id": "payload", "kind": "json", "content": original}],
         }
-        with tempfile.TemporaryDirectory() as tmp:
+        with writable_temp_directory() as tmp:
             store = ContentStore(Path(tmp) / "blobs")
             result = EconomyContextPlanner(store).build(packet, token_budget=100)
             recovery_key = result.receipt["recovery_keys"]["payload"]
@@ -237,7 +261,7 @@ class RecoverableEconomyModeTests(unittest.TestCase):
             "task": "Inspect number",
             "items": [{"id": "number", "kind": "json", "content": original}],
         }
-        with tempfile.TemporaryDirectory() as tmp:
+        with writable_temp_directory() as tmp:
             result = EconomyContextPlanner(ContentStore(Path(tmp) / "blobs")).build(
                 packet, token_budget=100
             )
@@ -249,7 +273,7 @@ class RecoverableEconomyModeTests(unittest.TestCase):
         task = " ".join(f"term{index}" for index in range(1001))
         required = {"id": "required", "content": "must preserve", "required": True}
         optional = {"id": "optional", "content": task}
-        with tempfile.TemporaryDirectory() as tmp:
+        with writable_temp_directory() as tmp:
             planner = EconomyContextPlanner(ContentStore(Path(tmp) / "blobs"))
             optional_only = planner.build({"task": task, "items": [optional]}, token_budget=10_000)
             result = planner.build(
@@ -273,7 +297,7 @@ class RecoverableEconomyModeTests(unittest.TestCase):
                 },
             ],
         }
-        with tempfile.TemporaryDirectory() as tmp:
+        with writable_temp_directory() as tmp:
             result = EconomyContextPlanner(ContentStore(Path(tmp) / "blobs")).build(
                 packet, token_budget=1
             )
@@ -290,7 +314,7 @@ class RecoverableEconomyModeTests(unittest.TestCase):
                 {"id": "lower", "content": "us"},
             ],
         }
-        with tempfile.TemporaryDirectory() as tmp:
+        with writable_temp_directory() as tmp:
             result = EconomyContextPlanner(ContentStore(Path(tmp) / "blobs")).build(
                 packet, token_budget=100
             )
@@ -306,7 +330,7 @@ class RecoverableEconomyModeTests(unittest.TestCase):
                 {"id": "two-spaces", "content": "if ready:\n  result = 1"},
             ],
         }
-        with tempfile.TemporaryDirectory() as tmp:
+        with writable_temp_directory() as tmp:
             result = EconomyContextPlanner(ContentStore(Path(tmp) / "blobs")).build(
                 packet, token_budget=100
             )
@@ -322,7 +346,7 @@ class RecoverableEconomyModeTests(unittest.TestCase):
                 {"id": "contract-b", "content": "Keep API stable.", "required": True},
             ],
         }
-        with tempfile.TemporaryDirectory() as tmp:
+        with writable_temp_directory() as tmp:
             result = EconomyContextPlanner(ContentStore(Path(tmp) / "blobs")).build(
                 packet, token_budget=1
             )
@@ -335,7 +359,7 @@ class RecoverableEconomyModeTests(unittest.TestCase):
             "task": "Find timeout",
             "items": [{"id": "huge", "content": "timeout " * 500}],
         }
-        with tempfile.TemporaryDirectory() as tmp:
+        with writable_temp_directory() as tmp:
             store = ContentStore(Path(tmp) / "blobs")
             result = EconomyContextPlanner(store).build(packet, token_budget=20)
             recovery_key = result.receipt["recovery_keys"]["huge"]
@@ -346,7 +370,7 @@ class RecoverableEconomyModeTests(unittest.TestCase):
         self.assertTrue(result.receipt["quality_gates"]["budget_respected_or_mandatory_overflow"])
 
     def test_canonical_benchmark_proves_savings_and_quality_gates(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with writable_temp_directory() as tmp:
             report = run_benchmark(Path(tmp) / "blobs")
 
         self.assertGreaterEqual(report["aggregate"]["reduction_pct"], 70.0)
@@ -359,7 +383,7 @@ class RecoverableEconomyModeTests(unittest.TestCase):
 
 class CacheAndTasksTests(unittest.TestCase):
     def test_context_cache_reuses_identical_content(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with writable_temp_directory() as tmp:
             cache = LocalContextCache(Path(tmp) / "cache.json")
             first = cache.remember("same content")
             second = cache.remember("same content")
@@ -368,7 +392,7 @@ class CacheAndTasksTests(unittest.TestCase):
             self.assertEqual(first.key, second.key)
 
     def test_task_store_creates_and_updates_local_task(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with writable_temp_directory() as tmp:
             store = TaskStore(Path(tmp) / "tasks.json")
             task = store.add("Prepare Build Week demo", priority="high")
             self.assertEqual(task.status, "todo")
@@ -377,7 +401,7 @@ class CacheAndTasksTests(unittest.TestCase):
             self.assertEqual(store.list()[0].title, "Prepare Build Week demo")
 
     def test_savings_ledger_persists_receipts_and_totals(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with writable_temp_directory() as tmp:
             ledger = SavingsLedger(Path(tmp) / "receipts.jsonl")
             ledger.record({"input_tokens_before": 100, "input_tokens_after": 60})
             ledger.record({"input_tokens_before": 20, "input_tokens_after": 10})

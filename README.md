@@ -6,6 +6,36 @@ Freesha reduces avoidable input tokens before an API call, keeps large omitted d
 
 > Bundled offline benchmark: **76.68% aggregate reduction** with the dependency-free fallback estimator and **79.59%** with optional `tiktoken/o200k_base`, with all deterministic quality gates passing. These are workload-specific local estimates—not a guarantee for every request and not a provider billing receipt.
 
+Public MVP demo: [YouTube](https://youtu.be/Vn4Kng-07W4). The video demonstrates the stable economy pipeline; the JOY routing preview described below is a separate experiment added afterward.
+
+## 60-second judge check (no API key)
+
+Linux/macOS:
+
+```bash
+python3 -m unittest discover -s tests
+python3 freesha_core.py benchmark --store .freesha/judge-benchmark
+python3 freesha_core.py joy examples/joy_task.json --models examples/joy_models.fixture.json --dry-run --store .freesha/judge-joy
+```
+
+Windows PowerShell or CMD:
+
+```powershell
+py -3.11 -m unittest discover -s tests
+py -3.11 freesha_core.py benchmark --store .freesha/judge-benchmark
+py -3.11 freesha_core.py joy examples/joy_task.json --models examples/joy_models.fixture.json --dry-run --store .freesha/judge-joy
+```
+
+All three commands are local and deterministic. Check `quality_gates.all_passed: true` in the benchmark, then `route_found: true`, `network_calls: 0`, `provider_request_sent: false`, and `automatic_spend: false` in the JOY receipt.
+
+## Product boundary
+
+| Status | Capability |
+| --- | --- |
+| Current stable MVP | Lossless JSON minification, recoverable log compaction, exact deduplication, budgeted context selection, local recovery, receipts, net-loss passthrough, and opt-in prompt-cache request preparation. |
+| Experimental now | JOY fixture-based routing preview: local, deterministic, dry-run only, and unable to execute provider calls or spend. |
+| Roadmap, not implemented | Real-task shadow evaluation, provider-authoritative usage receipts, opt-in live routing, transparent gateway integration, and a local receipt UI. |
+
 ## Why it exists
 
 AI apps repeatedly send waste that does not improve the answer:
@@ -45,7 +75,9 @@ API call only when the host application explicitly makes one
 
 ## Quick start
 
-Python 3.11+:
+Python 3.11+ is required. The default path uses only the Python standard library. The CLI is intended for Linux, macOS, and Windows; the commands in this upgrade were executed on Windows, while cross-platform CI is not yet configured.
+
+Install from a clean checkout:
 
 ```bash
 git clone https://github.com/rexamax/freesha.git
@@ -102,6 +134,36 @@ Expected shape (exact token counts can differ depending on whether optional `tik
 ```
 
 The benchmark intentionally reports each scenario separately. JSON whitespace removal may save much less than repetitive logs; a short prompt may save nothing.
+
+## Experimental JOY routing preview
+
+JOY means **Justify, Optimize, Yield**. JOY is experimental, local, deterministic, and does not execute provider calls. It first asks the existing economy planner for an optimized local context estimate, rejects every model fixture that violates a hard task constraint, then ranks the remaining entries by projected input cost, latency tier, and model ID.
+
+```bash
+python3 freesha_core.py joy examples/joy_task.json \
+  --models examples/joy_models.fixture.json \
+  --dry-run
+```
+
+Representative excerpt from the dependency-free run of the committed synthetic fixture (the optional tokenizer can change the estimate):
+
+```json
+{
+  "mode": "joy-dry-run",
+  "experimental": true,
+  "selected_model": {
+    "id": "fixture/economy",
+    "estimated_input_tokens": 127,
+    "projected_input_cost": 0.0000254,
+    "currency": "USD"
+  },
+  "network_calls": 0,
+  "provider_request_sent": false,
+  "automatic_spend": false
+}
+```
+
+The catalog is explicitly fixture-only. Its model IDs, quality scores, latency tiers, and costs are synthetic estimates—not current provider rankings, availability, pricing, or a recommendation to spend. Omitting `--dry-run` fails closed. A successful preview returns a safe task fingerprint, constraint decisions, rejection reasons, higher-quality fallback candidates, and local recovery handles without serializing the raw task or context.
 
 ## CLI
 
@@ -249,7 +311,7 @@ The included mixed fixture currently clears 70% aggregate reduction because it c
 ## Privacy and storage
 
 - Recovery blobs remain local and are ignored by Git through `.freesha/`.
-- Blob filenames are SHA-256 hashes; files are created with owner-only permissions.
+- Blob filenames are SHA-256 hashes. Freesha requests `0700`/`0600` permissions on POSIX; on Windows it relies on inherited filesystem ACLs, so keep `.freesha/` inside a protected user profile. The store is not encrypted.
 - The cache stores no API key.
 - `forward_chat()` is explicit opt-in and requires `OPENAI_API_KEY` only at call time.
 - Do not commit recovery blobs, `.env`, API keys, session files, customer data, or private source material.
@@ -265,15 +327,25 @@ The implementation is independent and does not copy third-party code. Its provid
 - [OpenAI cost optimization](https://developers.openai.com/api/docs/guides/cost-optimization)
 - [OpenAI tool search](https://developers.openai.com/api/docs/guides/tools-tool-search)
 
+## How Codex and GPT-5.6 were used
+
+Codex accelerated repository inspection, the Windows concurrency audit, vertical RED→GREEN tests, CLI implementation, deterministic benchmark execution, and an independent review of this bounded JOY experiment. GPT-5.6 guidance informed the existing prompt-cache preparation path and the conservative API-contract decisions: supported fields only, stable-prefix planning, provider usage as authority, and no assumption that cached or locally removed tokens equal billed savings.
+
+The product choices remained human decisions: local-first execution, reversible omissions, verbatim critical lines, net-loss passthrough, no hidden calls, no automatic spend, and claims limited to reproducible evidence. The real Codex `/feedback` Session ID belongs in the Devpost submission; it must be generated in the project session and is intentionally neither invented nor stored in this repository.
+
 ## Limitations and next high-ROI step
 
-Freesha is a working local core and CLI, not yet a transparent HTTP proxy or native Codex hook. The next production milestone should be an OpenAI Responses-compatible local gateway that:
+Freesha is a working local core and CLI, not a transparent gateway or native Codex hook. It has no UI, live adaptive routing, or provider-authoritative proof that the local estimates reduce a real bill. JOY does not know current model availability or pricing and cannot execute its suggested route.
 
-1. calls the official token-count endpoint optionally;
-2. records provider usage receipts;
-3. supports explicit cache breakpoints for stable prefixes;
-4. runs a fixed answer-quality eval suite;
-5. exposes recovery through a narrow local tool.
+The next production milestone should be shadow evaluation against a fixed real-task suite, without provider routing changes. That evaluation should:
+
+1. call the official token-count endpoint only through explicit opt-in;
+2. record provider usage receipts separately from local estimates;
+3. compare the same model/settings before and after optimization;
+4. run fixed correctness and context-recall gates;
+5. keep every route recommendation advisory until the evidence is reviewable.
+
+See [the future roadmap](docs/FUTURE_ROADMAP_DRAFT.md) for the staged boundary.
 
 ## License
 
