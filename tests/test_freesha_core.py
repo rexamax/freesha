@@ -1,9 +1,15 @@
+import http.client
+import io
 import json
+import os
 import shutil
+import threading
 import unittest
+import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,6 +21,8 @@ from freesha_core import (
     SavingsLedger,
     TaskStore,
     ToolOutputCompactor,
+    _exclusive_file_lock,
+    _NoRedirectHandler,
     forward_chat,
     run_benchmark,
 )
@@ -134,7 +142,7 @@ def parse(value: str, limit: int = 3) -> list[str]:
             def read(self):
                 return b'{"ok": true}'
 
-        with patch("urllib.request.urlopen", return_value=Response()) as send:
+        with patch("freesha_core._open_without_redirects", return_value=Response()) as send:
             result = forward_chat(
                 {"model": "gpt-5.6", "messages": []},
                 "synthetic-test-key",
@@ -143,6 +151,75 @@ def parse(value: str, limit: int = 3) -> list[str]:
 
         self.assertEqual(result, {"ok": True})
         self.assertEqual(send.call_count, 1)
+
+    def test_forward_chat_rejects_every_redirect_hop(self):
+        cases = [
+            ("https://safe.example/start", "http://attacker.example/steal"),
+            ("https://safe.example/start", "https://other.example/steal"),
+            ("http://127.0.0.1/start", "http://attacker.example/steal"),
+            ("https://safe.example/start", "https://safe.example/next"),
+        ]
+        handler = _NoRedirectHandler()
+        for source, target in cases:
+            with self.subTest(source=source, target=target):
+                request = urllib.request.Request(source)
+                redirected = handler.redirect_request(
+                    request,
+                    io.BytesIO(),
+                    302,
+                    "Found",
+                    http.client.HTTPMessage(),
+                    target,
+                )
+                self.assertIsNone(redirected)
+
+    def test_forward_chat_does_not_follow_redirects_with_authorization(self):
+        received_authorization: list[str | None] = []
+
+        class TargetHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                received_authorization.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"unexpected": true}')
+
+            def log_message(self, format, *args):
+                pass
+
+        target = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+        target_thread = threading.Thread(target=target.serve_forever, daemon=True)
+        target_thread.start()
+        target_url = f"http://127.0.0.1:{target.server_port}/steal"
+
+        class RedirectHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(302)
+                self.send_header("Location", target_url)
+                self.end_headers()
+
+            def log_message(self, format, *args):
+                pass
+
+        redirect = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+        redirect_thread = threading.Thread(target=redirect.serve_forever, daemon=True)
+        redirect_thread.start()
+
+        try:
+            with self.assertRaisesRegex(RuntimeError, "upstream HTTP 302"):
+                forward_chat(
+                    {"model": "gpt-5.6", "messages": []},
+                    "synthetic-test-key",
+                    endpoint=f"http://127.0.0.1:{redirect.server_port}/start",
+                )
+        finally:
+            redirect.shutdown()
+            redirect.server_close()
+            target.shutdown()
+            target.server_close()
+            redirect_thread.join(timeout=2)
+            target_thread.join(timeout=2)
+
+        self.assertEqual(received_authorization, [])
 
 
 class RecoverableEconomyModeTests(unittest.TestCase):
@@ -451,6 +528,27 @@ class CacheAndTasksTests(unittest.TestCase):
             self.assertTrue(second.hit)
             self.assertEqual(first.key, second.key)
 
+    def test_atomic_state_write_syncs_parent_directory(self):
+        with writable_temp_directory() as tmp:
+            path = Path(tmp) / "cache.json"
+            with patch("freesha_core._fsync_directory") as sync_directory:
+                LocalContextCache(path).remember("durable content")
+
+            sync_directory.assert_called_once_with(path.parent)
+
+    def test_lock_acquisition_failure_is_not_masked_by_unlock(self):
+        lock_target = "msvcrt.locking" if os.name == "nt" else "fcntl.flock"
+        with writable_temp_directory() as tmp:
+            path = Path(tmp) / "cache.json"
+            with (
+                patch(lock_target, side_effect=OSError("acquire failed")) as lock_call,
+                self.assertRaisesRegex(OSError, "acquire failed"),
+                _exclusive_file_lock(path),
+            ):
+                self.fail("body must not run without the lock")
+
+            self.assertEqual(lock_call.call_count, 1)
+
     def test_context_cache_preserves_malformed_state_and_fails_closed(self):
         with writable_temp_directory() as tmp:
             path = Path(tmp) / "cache.json"
@@ -461,6 +559,29 @@ class CacheAndTasksTests(unittest.TestCase):
                 LocalContextCache(path).remember("new content")
 
             self.assertEqual(path.read_bytes(), damaged)
+
+    def test_context_cache_rejects_invalid_nested_schema_without_overwrite(self):
+        valid_key = "a" * 64
+        cases = [
+            {"x": {"tokens": 1, "last_seen": 1.0}},
+            {valid_key: "not-a-cache-entry"},
+            {valid_key: {"tokens": 1}},
+            {valid_key: {"tokens": 1, "last_seen": 1.0, "extra": True}},
+            {valid_key: {"tokens": True, "last_seen": 1.0}},
+            {valid_key: {"tokens": -1, "last_seen": 1.0}},
+            {valid_key: {"tokens": 1, "last_seen": False}},
+            {valid_key: {"tokens": 1, "last_seen": float("nan")}},
+        ]
+        for index, value in enumerate(cases):
+            with self.subTest(case=index), writable_temp_directory() as tmp:
+                path = Path(tmp) / "cache.json"
+                damaged = json.dumps(value).encode()
+                path.write_bytes(damaged)
+
+                with self.assertRaisesRegex(ValueError, "schema"):
+                    LocalContextCache(path).remember("new content")
+
+                self.assertEqual(path.read_bytes(), damaged)
 
     def test_context_cache_concurrent_instances_preserve_all_updates(self):
         with writable_temp_directory() as tmp:
@@ -495,6 +616,38 @@ class CacheAndTasksTests(unittest.TestCase):
                 TaskStore(path).add("new task")
 
             self.assertEqual(path.read_bytes(), damaged)
+
+    def test_task_store_rejects_invalid_nested_schema_without_overwrite(self):
+        valid = {
+            "id": "a" * 10,
+            "title": "task",
+            "status": "todo",
+            "priority": "normal",
+            "created_at": 1.0,
+            "updated_at": 2.0,
+        }
+        cases = [
+            "not-a-task-row",
+            {key: value for key, value in valid.items() if key != "status"},
+            {**valid, "extra": True},
+            {**valid, "id": 123},
+            {**valid, "status": True},
+            {**valid, "priority": None},
+            {**valid, "created_at": "yesterday"},
+            {**valid, "updated_at": []},
+            {**valid, "updated_at": 0.0},
+            {**valid, "created_at": float("inf")},
+        ]
+        for index, row in enumerate(cases):
+            with self.subTest(case=index), writable_temp_directory() as tmp:
+                path = Path(tmp) / "tasks.json"
+                damaged = json.dumps([row]).encode()
+                path.write_bytes(damaged)
+
+                with self.assertRaisesRegex(ValueError, "schema"):
+                    TaskStore(path).add("new task")
+
+                self.assertEqual(path.read_bytes(), damaged)
 
     def test_task_store_concurrent_instances_preserve_all_updates(self):
         with writable_temp_directory() as tmp:

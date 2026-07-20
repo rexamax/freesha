@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import argparse
 import ast
+import errno
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import sys
@@ -332,6 +334,22 @@ def _exclusive_file_lock(path: Path):
             handle.close()
 
 
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":  # Directory fsync is not exposed by this Windows interface.
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            unsupported = {errno.EBADF, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}
+            if exc.errno not in unsupported:
+                raise
+    finally:
+        os.close(descriptor)
+
+
 def _atomic_write(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     serialized = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
@@ -352,6 +370,7 @@ def _atomic_write(path: Path, data: Any) -> None:
         os.chmod(temp, 0o600)
         temp.replace(path)
         os.chmod(path, 0o600)
+        _fsync_directory(path.parent)
     finally:
         if temp.exists():
             temp.unlink()
@@ -707,6 +726,25 @@ class LocalContextCache:
             raise ValueError(f"malformed context cache state: {self.path}") from exc
         if not isinstance(value, dict):
             raise ValueError(f"malformed context cache state: {self.path}")
+        for key, entry in value.items():
+            valid_key = isinstance(key, str) and re.fullmatch(r"[0-9a-f]{64}", key)
+            valid_entry = isinstance(entry, dict) and set(entry) == {
+                "tokens",
+                "last_seen",
+            }
+            if not valid_key or not valid_entry:
+                raise ValueError(f"context cache schema violation: {self.path}")
+            tokens = entry["tokens"]
+            last_seen = entry["last_seen"]
+            valid_tokens = isinstance(tokens, int) and not isinstance(tokens, bool) and tokens >= 0
+            valid_timestamp = (
+                isinstance(last_seen, (int, float))
+                and not isinstance(last_seen, bool)
+                and math.isfinite(last_seen)
+                and last_seen >= 0
+            )
+            if not valid_tokens or not valid_timestamp:
+                raise ValueError(f"context cache schema violation: {self.path}")
         return value
 
     def remember(self, content: str) -> CacheResult:
@@ -736,17 +774,45 @@ class TaskStore:
             raise ValueError(f"malformed task state: {self.path}") from exc
         if not isinstance(rows, list):
             raise ValueError(f"malformed task state: {self.path}")
-        try:
-            return [Task(**row) for row in rows]
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"malformed task state: {self.path}") from exc
+        expected_fields = {
+            "id",
+            "title",
+            "status",
+            "priority",
+            "created_at",
+            "updated_at",
+        }
+        tasks: list[Task] = []
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != expected_fields:
+                raise ValueError(f"task state schema violation: {self.path}")
+            valid_strings = all(
+                isinstance(row[field], str) and bool(row[field].strip())
+                for field in ("id", "title", "status", "priority")
+            )
+            valid_id = valid_strings and re.fullmatch(r"[0-9a-f]{10}", row["id"])
+            created_at = row["created_at"]
+            updated_at = row["updated_at"]
+            valid_times = all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                and value >= 0
+                for value in (created_at, updated_at)
+            )
+            if not valid_id or not valid_times or updated_at < created_at:
+                raise ValueError(f"task state schema violation: {self.path}")
+            tasks.append(Task(**row))
+        return tasks
 
     def _save(self, tasks: list[Task]) -> None:
         _atomic_write(self.path, [asdict(task) for task in tasks])
 
     def add(self, title: str, priority: str = "normal") -> Task:
-        if not str(title).strip():
-            raise ValueError("task title cannot be empty")
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError("task title must be a non-empty string")
+        if not isinstance(priority, str) or not priority.strip():
+            raise ValueError("task priority must be a non-empty string")
         with _exclusive_file_lock(self.path):
             tasks = self._load()
             now = time.time()
@@ -762,9 +828,15 @@ class TaskStore:
         return task
 
     def update(self, task_id: str, **changes: str) -> Task:
+        if not isinstance(task_id, str) or not re.fullmatch(r"[0-9a-f]{10}", task_id):
+            raise ValueError("task id must be a 10-character lowercase hex string")
+        allowed = {"title", "status", "priority"}
+        if set(changes) - allowed:
+            raise ValueError("task updates contain unsupported fields")
+        if any(not isinstance(value, str) or not value.strip() for value in changes.values()):
+            raise ValueError("task update values must be non-empty strings")
         with _exclusive_file_lock(self.path):
             tasks = self._load()
-            allowed = {"title", "status", "priority"}
             for task in tasks:
                 if task.id == task_id:
                     for key, value in changes.items():
@@ -952,6 +1024,17 @@ def run_benchmark(store_path: Path) -> dict[str, Any]:
     }
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _open_without_redirects(request: urllib.request.Request, timeout: float):
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+    # The custom handler denies every redirect before another request is created.
+    return opener.open(request, timeout=timeout)  # nosec B310
+
+
 def forward_chat(
     payload: dict[str, Any],
     api_key: str | None = None,
@@ -987,10 +1070,13 @@ def forward_chat(
     )
     try:
         # Endpoint scheme/host policy is enforced above before the bearer key enters a request.
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
+        with _open_without_redirects(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        finally:
+            exc.close()
         raise RuntimeError(f"upstream HTTP {exc.code}: {body[:500]}") from exc
 
 

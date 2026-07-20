@@ -68,7 +68,7 @@ API call only when the host application explicitly makes one
 
 - **Local by default:** optimization and benchmark commands make zero network calls.
 - **Recoverable and integrity-checked:** compressed or omitted content is stored under `.freesha/blobs/` by SHA-256, verified against its recovery key on read, and restored byte-for-byte. A modified blob fails closed instead of being returned as valid.
-- **Crash/concurrency-safe state writes:** cache and task updates use OS-level file locks, unique temporary files, `fsync`, and atomic replacement. Malformed state fails closed and is left untouched.
+- **Atomic/concurrency-safe state writes:** cache and task updates use OS-level file locks, unique temporary files, file `fsync`, atomic replacement, and parent-directory `fsync` where the platform supports it. Syntactically or semantically malformed state fails closed and is left untouched.
 - **Critical-line preservation:** errors, failures, warnings, exceptions, panics, access denials, and timeouts are kept verbatim during log compaction.
 - **Net-loss gate:** short or incompressible output is returned unchanged.
 - **No unknown request fields:** the old custom `metadata` injection was removed.
