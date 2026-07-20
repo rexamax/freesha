@@ -1,0 +1,58 @@
+{
+  "fixture_only": true,
+  "catalog_id": "joy-synthetic-v1",
+  "source_label": "Synthetic Build Week fixture estimates, not provider pricing",
+  "as_of": "2026-07-19",
+  "currency": "USD",
+  "cost_unit": "per_million_input_tokens",
+  "latency_tiers": ["fast", "standard", "slow"],
+  "supported_tools": ["json-output", "repository-search"],
+  "supported_privacy_policies": ["public", "no-training"],
+  "supported_data_classes": ["synthetic-public", "internal"],
+  "models": [
+    {
+      "id": "fixture/cheap-risky",
+      "task_types": ["extraction"],
+      "capabilities": ["text", "json"],
+      "tools": ["json-output"],
+      "quality_by_task": {"extraction": 0.82},
+      "privacy_policies": ["no-training"],
+      "data_classes": ["internal"],
+      "latency_tier": "fast",
+      "input_cost_per_million": 0.05
+    },
+    {
+      "id": "fixture/economy",
+      "task_types": ["extraction", "coding"],
+      "capabilities": ["text", "json", "code"],
+      "tools": ["json-output", "repository-search"],
+      "quality_by_task": {"extraction": 0.91, "coding": 0.88},
+      "privacy_policies": ["public", "no-training"],
+      "data_classes": ["synthetic-public", "internal"],
+      "latency_tier": "fast",
+      "input_cost_per_million": 0.2
+    },
+    {
+      "id": "fixture/balanced",
+      "task_types": ["extraction", "coding", "planning"],
+      "capabilities": ["text", "json", "code", "tool-use"],
+      "tools": ["json-output", "repository-search"],
+      "quality_by_task": {"extraction": 0.96, "coding": 0.95, "planning": 0.94},
+      "privacy_policies": ["public", "no-training"],
+      "data_classes": ["synthetic-public", "internal"],
+      "latency_tier": "standard",
+      "input_cost_per_million": 1.1
+    },
+    {
+      "id": "fixture/vision-specialist",
+      "task_types": ["vision"],
+      "capabilities": ["text", "vision"],
+      "tools": [],
+      "quality_by_task": {"vision": 0.97},
+      "privacy_policies": ["public"],
+      "data_classes": ["synthetic-public"],
+      "latency_tier": "slow",
+      "input_cost_per_million": 2.4
+    }
+  ]
+}

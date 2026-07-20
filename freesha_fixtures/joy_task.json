@@ -1,0 +1,37 @@
+{
+  "task": "Extract the synthetic incident IDs and statuses as compact JSON.",
+  "task_type": "extraction",
+  "required_capabilities": ["text", "json"],
+  "required_tools": ["json-output"],
+  "minimum_quality": 0.9,
+  "approved_privacy_policy": "public",
+  "data_class": "synthetic-public",
+  "maximum_latency_tier": "standard",
+  "maximum_input_cost": 0.005,
+  "context_token_budget": 260,
+  "context_packet": {
+    "items": [
+      {
+        "id": "output-contract",
+        "content": "Return every incident ID and status. Keep exact identifiers and emit valid JSON.",
+        "required": true,
+        "priority": "critical"
+      },
+      {
+        "id": "incident-json",
+        "kind": "json",
+        "content": "{\n    \"incidents\": [\n        {\n            \"id\": \"SYN-1042\",\n            \"status\": \"open\",\n            \"team\": \"fixture-alpha\"\n        },\n        {\n            \"id\": \"SYN-1043\",\n            \"status\": \"resolved\",\n            \"team\": \"fixture-beta\"\n        },\n        {\n            \"id\": \"SYN-1044\",\n            \"status\": \"investigating\",\n            \"team\": \"fixture-alpha\"\n        }\n    ],\n    \"source\": \"synthetic-demo\"\n}"
+      },
+      {
+        "id": "duplicate-json",
+        "kind": "json",
+        "content": "{\n    \"incidents\": [\n        {\n            \"id\": \"SYN-1042\",\n            \"status\": \"open\",\n            \"team\": \"fixture-alpha\"\n        },\n        {\n            \"id\": \"SYN-1043\",\n            \"status\": \"resolved\",\n            \"team\": \"fixture-beta\"\n        },\n        {\n            \"id\": \"SYN-1044\",\n            \"status\": \"investigating\",\n            \"team\": \"fixture-alpha\"\n        }\n    ],\n    \"source\": \"synthetic-demo\"\n}"
+      },
+      {
+        "id": "irrelevant-note",
+        "content": "Synthetic color palette discussion unrelated to incident extraction.",
+        "priority": "low"
+      }
+    ]
+  }
+}

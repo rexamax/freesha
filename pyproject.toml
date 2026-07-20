@@ -10,7 +10,7 @@ dependencies = []
 
 [project.optional-dependencies]
 tokens = ["tiktoken>=0.13"]
-dev = ["ruff>=0.15"]
+dev = ["ruff>=0.15", "build>=1.2"]
 
 [project.scripts]
 freesha = "freesha_core:main"
@@ -21,6 +21,10 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 py-modules = ["freesha_core", "freesha_joy"]
+packages = ["freesha_fixtures"]
+
+[tool.setuptools.package-data]
+freesha_fixtures = ["*.json"]
 
 [tool.ruff]
 line-length = 100

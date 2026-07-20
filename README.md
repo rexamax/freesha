@@ -67,7 +67,8 @@ API call only when the host application explicitly makes one
 ### Safety properties
 
 - **Local by default:** optimization and benchmark commands make zero network calls.
-- **Recoverable:** compressed or omitted content is stored under `.freesha/blobs/` by SHA-256 and can be restored byte-for-byte.
+- **Recoverable and integrity-checked:** compressed or omitted content is stored under `.freesha/blobs/` by SHA-256, verified against its recovery key on read, and restored byte-for-byte. A modified blob fails closed instead of being returned as valid.
+- **Crash/concurrency-safe state writes:** cache and task updates use OS-level file locks, unique temporary files, `fsync`, and atomic replacement. Malformed state fails closed and is left untouched.
 - **Critical-line preservation:** errors, failures, warnings, exceptions, panics, access denials, and timeouts are kept verbatim during log compaction.
 - **Net-loss gate:** short or incompressible output is returned unchanged.
 - **No unknown request fields:** the old custom `metadata` injection was removed.
@@ -75,7 +76,7 @@ API call only when the host application explicitly makes one
 
 ## Quick start
 
-Python 3.11+ is required. The default path uses only the Python standard library. The CLI is intended for Linux, macOS, and Windows; the commands in this upgrade were executed on Windows, while cross-platform CI is not yet configured.
+Python 3.11+ is required. The default path uses only the Python standard library. The CLI is intended for Linux, macOS, and Windows and is checked by a three-OS GitHub Actions matrix.
 
 Install from a clean checkout:
 
@@ -93,6 +94,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e '.[tokens]'
 freesha benchmark
+freesha joy --dry-run
 ```
 
 `tiktoken/o200k_base` is labeled as a **local estimate**. OpenAI's token-count endpoint and response `usage` fields are authoritative for provider billing.
@@ -140,9 +142,14 @@ The benchmark intentionally reports each scenario separately. JSON whitespace re
 JOY means **Justify, Optimize, Yield**. JOY is experimental, local, deterministic, and does not execute provider calls. It first asks the existing economy planner for an optimized local context estimate, rejects every model fixture that violates a hard task constraint, then ranks the remaining entries by projected input cost, latency tier, and model ID.
 
 ```bash
+freesha joy --dry-run
+```
+
+The installed command uses bundled synthetic fixtures. From a checkout, explicit fixture paths remain supported:
+
+```bash
 python3 freesha_core.py joy examples/joy_task.json \
-  --models examples/joy_models.fixture.json \
-  --dry-run
+  --models examples/joy_models.fixture.json --dry-run
 ```
 
 Representative excerpt from the dependency-free run of the committed synthetic fixture (the optional tokenizer can change the estimate):
@@ -212,7 +219,7 @@ Input contract:
 Rules:
 
 - `id` must be a unique, short public-safe identifier, not a filesystem path;
-- `required: true` always wins;
+- `required` must be a JSON boolean; `required: true` always wins;
 - relevance is deterministic lexical overlap plus explicit priority and critical signals;
 - `kind: "json"` enables lossless minification;
 - `kind: "log"` enables recoverable template compaction;
@@ -313,7 +320,7 @@ The included mixed fixture currently clears 70% aggregate reduction because it c
 - Recovery blobs remain local and are ignored by Git through `.freesha/`.
 - Blob filenames are SHA-256 hashes. Freesha requests `0700`/`0600` permissions on POSIX; on Windows it relies on inherited filesystem ACLs, so keep `.freesha/` inside a protected user profile. The store is not encrypted.
 - The cache stores no API key.
-- `forward_chat()` is explicit opt-in and requires `OPENAI_API_KEY` only at call time.
+- `forward_chat()` is explicit opt-in and requires `OPENAI_API_KEY` only at call time. Remote endpoints must use HTTPS; plain HTTP is accepted only for literal loopback hosts used by local compatible servers.
 - Do not commit recovery blobs, `.env`, API keys, session files, customer data, or private source material.
 - Treat recovery keys as sensitive references when the underlying content is sensitive.
 

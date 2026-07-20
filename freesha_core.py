@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -17,9 +18,12 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Iterable
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
@@ -289,11 +293,68 @@ class FreeshaOptimizer:
         return optimized
 
 
+@contextmanager
+def _exclusive_file_lock(path: Path):
+    """Serialize a state-file transaction across threads and processes."""
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    locked = False
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":  # pragma: no cover - exercised on Windows
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        locked = True
+        yield
+    finally:
+        try:
+            if locked:
+                handle.seek(0)
+                if os.name == "nt":  # pragma: no cover - exercised on Windows
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
 def _atomic_write(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temp.replace(path)
+    serialized = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        encoding="utf-8",
+        newline="\n",
+        delete=False,
+    ) as handle:
+        handle.write(serialized)
+        handle.flush()
+        os.fsync(handle.fileno())
+        temp = Path(handle.name)
+    try:
+        os.chmod(temp, 0o600)
+        temp.replace(path)
+        os.chmod(path, 0o600)
+    finally:
+        if temp.exists():
+            temp.unlink()
 
 
 class ContentStore:
@@ -305,6 +366,15 @@ class ContentStore:
         self.path = Path(path)
         self._write_lock = threading.Lock()
 
+    def _read_verified(self, destination: Path, key: str) -> str:
+        data = destination.read_bytes()
+        if hashlib.sha256(data).hexdigest() != key:
+            raise ValueError(f"recovery blob integrity check failed: {key}")
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"recovery blob integrity check failed: {key}") from exc
+
     def put(self, content: str) -> str:
         text = str(content)
         key = hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -312,7 +382,9 @@ class ContentStore:
             self.path.mkdir(parents=True, exist_ok=True)
             os.chmod(self.path, 0o700)
             destination = self.path / f"{key}.txt"
-            if not destination.exists():
+            if destination.exists():
+                self._read_verified(destination, key)
+            else:
                 with tempfile.NamedTemporaryFile(
                     mode="wb",
                     dir=self.path,
@@ -335,7 +407,7 @@ class ContentStore:
         if key is None or not self._KEY.fullmatch(str(key)):
             raise ValueError("invalid recovery key")
         try:
-            return (self.path / f"{key}.txt").read_bytes().decode("utf-8")
+            return self._read_verified(self.path / f"{key}.txt", str(key))
         except FileNotFoundError as exc:
             raise KeyError(f"recovery content not found: {key}") from exc
 
@@ -511,7 +583,10 @@ class EconomyContextPlanner:
             dedupe_key = self._dedupe_key(original)
             content, key = self._prepare_content(raw)
             overlap = len(task_terms & self._terms(content))
-            required = bool(raw.get("required", False))
+            required_value = raw.get("required", False)
+            if not isinstance(required_value, bool):
+                raise ValueError("item required must be a boolean")
+            required = required_value
             priority = self._PRIORITY.get(str(raw.get("priority", "normal")), 2)
             score = overlap * 10 + priority
             if self._CRITICAL.search(content):
@@ -628,18 +703,21 @@ class LocalContextCache:
             return {}
         try:
             value = json.loads(self.path.read_text(encoding="utf-8"))
-            return value if isinstance(value, dict) else {}
-        except (OSError, json.JSONDecodeError):
-            return {}
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"malformed context cache state: {self.path}") from exc
+        if not isinstance(value, dict):
+            raise ValueError(f"malformed context cache state: {self.path}")
+        return value
 
     def remember(self, content: str) -> CacheResult:
         raw = str(content).encode("utf-8")
         key = hashlib.sha256(raw).hexdigest()
-        data = self._load()
-        hit = key in data
         tokens = TokenEstimator().count(content)
-        data[key] = {"tokens": tokens, "last_seen": time.time()}
-        _atomic_write(self.path, data)
+        with _exclusive_file_lock(self.path):
+            data = self._load()
+            hit = key in data
+            data[key] = {"tokens": tokens, "last_seen": time.time()}
+            _atomic_write(self.path, data)
         return CacheResult(key=key, hit=hit, tokens=tokens)
 
 
@@ -654,9 +732,14 @@ class TaskStore:
             return []
         try:
             rows = json.loads(self.path.read_text(encoding="utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"malformed task state: {self.path}") from exc
+        if not isinstance(rows, list):
+            raise ValueError(f"malformed task state: {self.path}")
+        try:
             return [Task(**row) for row in rows]
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            return []
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"malformed task state: {self.path}") from exc
 
     def _save(self, tasks: list[Task]) -> None:
         _atomic_write(self.path, [asdict(task) for task in tasks])
@@ -664,30 +747,32 @@ class TaskStore:
     def add(self, title: str, priority: str = "normal") -> Task:
         if not str(title).strip():
             raise ValueError("task title cannot be empty")
-        tasks = self._load()
-        now = time.time()
-        task = Task(
-            id=hashlib.sha1(f"{title}:{now}".encode()).hexdigest()[:10],
-            title=str(title).strip(),
-            priority=priority,
-            created_at=now,
-            updated_at=now,
-        )
-        tasks.append(task)
-        self._save(tasks)
+        with _exclusive_file_lock(self.path):
+            tasks = self._load()
+            now = time.time()
+            task = Task(
+                id=hashlib.sha256(f"{title}:{now}".encode()).hexdigest()[:10],
+                title=str(title).strip(),
+                priority=priority,
+                created_at=now,
+                updated_at=now,
+            )
+            tasks.append(task)
+            self._save(tasks)
         return task
 
     def update(self, task_id: str, **changes: str) -> Task:
-        tasks = self._load()
-        allowed = {"title", "status", "priority"}
-        for task in tasks:
-            if task.id == task_id:
-                for key, value in changes.items():
-                    if key in allowed:
-                        setattr(task, key, value)
-                task.updated_at = time.time()
-                self._save(tasks)
-                return task
+        with _exclusive_file_lock(self.path):
+            tasks = self._load()
+            allowed = {"title", "status", "priority"}
+            for task in tasks:
+                if task.id == task_id:
+                    for key, value in changes.items():
+                        if key in allowed:
+                            setattr(task, key, value)
+                    task.updated_at = time.time()
+                    self._save(tasks)
+                    return task
         raise KeyError(f"task not found: {task_id}")
 
     def list(self) -> list[Task]:
@@ -878,6 +963,22 @@ def forward_chat(
     if not key:
         raise RuntimeError("OPENAI_API_KEY is required only when --forward is used")
     url = endpoint or os.getenv("FREESHA_ENDPOINT", "https://api.openai.com/v1/chat/completions")
+    parsed_endpoint = urllib.parse.urlparse(url)
+    hostname = parsed_endpoint.hostname
+    loopback = hostname == "localhost"
+    if hostname and not loopback:
+        try:
+            loopback = ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            loopback = False
+    if parsed_endpoint.username or parsed_endpoint.password:
+        raise ValueError("endpoint URL must not contain credentials")
+    if parsed_endpoint.scheme != "https" and not (
+        parsed_endpoint.scheme == "http" and loopback
+    ):
+        raise ValueError("remote forwarding endpoint must use HTTPS")
+    if not hostname:
+        raise ValueError("forwarding endpoint must include a hostname")
     request = urllib.request.Request(
         url,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -885,7 +986,8 @@ def forward_chat(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        # Endpoint scheme/host policy is enforced above before the bearer key enters a request.
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
@@ -946,8 +1048,12 @@ def main(argv: list[str] | None = None) -> int:
     joy = sub.add_parser(
         "joy", help="preview experimental fixture-based model routing (dry-run only)"
     )
-    joy.add_argument("path", help="JOY task JSON")
-    joy.add_argument("--models", required=True, help="fixture-only model catalog JSON")
+    joy.add_argument(
+        "path", nargs="?", help="JOY task JSON; packaged synthetic fixture when omitted"
+    )
+    joy.add_argument(
+        "--models", help="fixture-only model catalog JSON; packaged fixture when omitted"
+    )
     joy.add_argument("--dry-run", action="store_true")
     joy.add_argument("--store", default=".freesha/joy-blobs")
     task = sub.add_parser("task")
@@ -1034,8 +1140,22 @@ def main(argv: list[str] | None = None) -> int:
         from freesha_joy import JoyRouter, load_json_object
 
         try:
-            task_payload = load_json_object(Path(args.path))
-            model_catalog = load_json_object(Path(args.models))
+            task_payload = (
+                load_json_object(Path(args.path))
+                if args.path
+                else json.loads(
+                    files("freesha_fixtures").joinpath("joy_task.json").read_text(encoding="utf-8")
+                )
+            )
+            model_catalog = (
+                load_json_object(Path(args.models))
+                if args.models
+                else json.loads(
+                    files("freesha_fixtures")
+                    .joinpath("joy_models.fixture.json")
+                    .read_text(encoding="utf-8")
+                )
+            )
         except OSError:
             parser.error("JOY could not read one of the input files")
         except (UnicodeError, json.JSONDecodeError, ValueError) as exc:

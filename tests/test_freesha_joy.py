@@ -394,6 +394,25 @@ class JoyRouterTests(unittest.TestCase):
         self.assertFalse(receipt["provider_request_sent"])
         self.assertFalse(receipt["automatic_spend"])
 
+    def test_cli_uses_packaged_joy_fixtures_when_paths_are_omitted(self):
+        root = Path(".test-state/joy-packaged")
+        stdout = io.StringIO()
+
+        with (
+            patch("urllib.request.urlopen", side_effect=AssertionError("network attempted")),
+            redirect_stdout(stdout),
+        ):
+            exit_code = main(
+                ["joy", "--dry-run", "--store", str(root / "blobs")]
+            )
+
+        receipt = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(receipt["catalog"]["id"], "joy-synthetic-v1")
+        self.assertTrue(receipt["catalog"]["fixture_only"])
+        self.assertEqual(receipt["selected_model"]["id"], "fixture/economy")
+        self.assertEqual(receipt["network_calls"], 0)
+
     def test_cli_reports_duplicate_catalog_without_traceback(self):
         root = Path(".test-state/joy-cli-invalid")
         root.mkdir(parents=True, exist_ok=True)

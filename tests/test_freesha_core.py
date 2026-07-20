@@ -5,6 +5,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 from freesha_core import (
     ContentStore,
@@ -14,6 +15,7 @@ from freesha_core import (
     SavingsLedger,
     TaskStore,
     ToolOutputCompactor,
+    forward_chat,
     run_benchmark,
 )
 
@@ -106,6 +108,42 @@ def parse(value: str, limit: int = 3) -> list[str]:
         result = FreeshaOptimizer().optimize_request(payload)
         self.assertNotIn("metadata", result.payload)
 
+    def test_forward_chat_rejects_insecure_remote_endpoint_before_sending_key(self):
+        endpoints = [
+            "http://example.com/v1/chat/completions",
+            "file:///tmp/fake-endpoint",
+            "ftp://example.com/chat",
+            "http://localhost.example.com/chat",
+        ]
+        for endpoint in endpoints:
+            with self.subTest(endpoint=endpoint), self.assertRaisesRegex(ValueError, "HTTPS"):
+                forward_chat(
+                    {"model": "gpt-5.6", "messages": []},
+                    "synthetic-test-key",
+                    endpoint=endpoint,
+                )
+
+    def test_forward_chat_allows_loopback_http_after_validation(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"ok": true}'
+
+        with patch("urllib.request.urlopen", return_value=Response()) as send:
+            result = forward_chat(
+                {"model": "gpt-5.6", "messages": []},
+                "synthetic-test-key",
+                endpoint="http://127.0.0.1:8080/v1/chat/completions",
+            )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(send.call_count, 1)
+
 
 class RecoverableEconomyModeTests(unittest.TestCase):
     def test_repetitive_tool_output_is_compacted_and_exactly_recoverable(self):
@@ -162,6 +200,18 @@ class RecoverableEconomyModeTests(unittest.TestCase):
         with writable_temp_directory() as tmp:
             store = ContentStore(Path(tmp) / "blobs")
             self.assertEqual(store.get(store.put(content)), content)
+
+    def test_content_store_rejects_tampered_existing_blob(self):
+        with writable_temp_directory() as tmp:
+            blob_path = Path(tmp) / "blobs"
+            store = ContentStore(blob_path)
+            key = store.put("original")
+            (blob_path / f"{key}.txt").write_text("tampered", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "integrity"):
+                store.get(key)
+            with self.assertRaisesRegex(ValueError, "integrity"):
+                store.put("original")
 
     def test_compactor_preserves_run_order_around_critical_event(self):
         routine = "2026-07-18T12:00:00Z INFO worker job=1000 completed in 10ms"
@@ -240,6 +290,16 @@ class RecoverableEconomyModeTests(unittest.TestCase):
             planner = EconomyContextPlanner(ContentStore(Path(tmp) / "blobs"))
             with self.assertRaisesRegex(ValueError, "unique"):
                 planner.build(packet, token_budget=100)
+
+    def test_context_planner_rejects_non_boolean_required_flag(self):
+        packet = {
+            "task": "Respect budget",
+            "items": [{"id": "oversized", "content": "noise " * 100, "required": "false"}],
+        }
+        with writable_temp_directory() as tmp:
+            planner = EconomyContextPlanner(ContentStore(Path(tmp) / "blobs"))
+            with self.assertRaisesRegex(ValueError, "required must be a boolean"):
+                planner.build(packet, token_budget=10)
 
     def test_minified_json_context_is_byte_recoverable(self):
         original = '{\n  "request": "req-42",\n  "flags": [true, false]\n}'
@@ -391,6 +451,31 @@ class CacheAndTasksTests(unittest.TestCase):
             self.assertTrue(second.hit)
             self.assertEqual(first.key, second.key)
 
+    def test_context_cache_preserves_malformed_state_and_fails_closed(self):
+        with writable_temp_directory() as tmp:
+            path = Path(tmp) / "cache.json"
+            damaged = b'{"unfinished":'
+            path.write_bytes(damaged)
+
+            with self.assertRaisesRegex(ValueError, "malformed"):
+                LocalContextCache(path).remember("new content")
+
+            self.assertEqual(path.read_bytes(), damaged)
+
+    def test_context_cache_concurrent_instances_preserve_all_updates(self):
+        with writable_temp_directory() as tmp:
+            path = Path(tmp) / "cache.json"
+            contents = [f"unique cache content {index}" for index in range(32)]
+
+            def remember(content):
+                return LocalContextCache(path).remember(content).key
+
+            with ThreadPoolExecutor(max_workers=16) as executor:
+                keys = list(executor.map(remember, contents))
+
+            stored = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(set(stored), set(keys))
+
     def test_task_store_creates_and_updates_local_task(self):
         with writable_temp_directory() as tmp:
             store = TaskStore(Path(tmp) / "tasks.json")
@@ -399,6 +484,32 @@ class CacheAndTasksTests(unittest.TestCase):
             updated = store.update(task.id, status="done")
             self.assertEqual(updated.status, "done")
             self.assertEqual(store.list()[0].title, "Prepare Build Week demo")
+
+    def test_task_store_preserves_malformed_state_and_fails_closed(self):
+        with writable_temp_directory() as tmp:
+            path = Path(tmp) / "tasks.json"
+            damaged = b"[not-json"
+            path.write_bytes(damaged)
+
+            with self.assertRaisesRegex(ValueError, "malformed"):
+                TaskStore(path).add("new task")
+
+            self.assertEqual(path.read_bytes(), damaged)
+
+    def test_task_store_concurrent_instances_preserve_all_updates(self):
+        with writable_temp_directory() as tmp:
+            path = Path(tmp) / "tasks.json"
+            titles = [f"independent task {index}" for index in range(32)]
+
+            def add(title):
+                return TaskStore(path).add(title).id
+
+            with ThreadPoolExecutor(max_workers=16) as executor:
+                ids = list(executor.map(add, titles))
+
+            tasks = TaskStore(path).list()
+            self.assertEqual({task.id for task in tasks}, set(ids))
+            self.assertEqual({task.title for task in tasks}, set(titles))
 
     def test_savings_ledger_persists_receipts_and_totals(self):
         with writable_temp_directory() as tmp:
